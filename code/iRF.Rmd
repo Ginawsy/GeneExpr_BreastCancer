@@ -1,0 +1,206 @@
+---
+title: "Gene expression and breast cancer longevity"
+author: "Shuyao Wang, Yanbo Wang, Sergio Mares"
+date: "2022-12-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(skimr)
+library(correlationfunnel)
+library(vdocs)
+library(randomForest)  # for fitting RF
+library(ranger)        # for fitting RF
+library(iRF)           # for fitting iRF
+library(caret)
+DATA_DIR <- "/Users/wangyanbo/Desktop/CS/STAT154/HW1"  
+
+mrna_orig <- fread(file.path(DATA_DIR, "data_mrna_agilent_microarray.txt")) %>%
+  as_tibble()
+clinical_orig <- fread(file.path(DATA_DIR, "brca_metabric_clinical_data.tsv")) %>%
+  as_tibble()
+
+```
+
+# Data pre-processing
+
+```{r}
+X <- mrna_orig %>%
+  select(-Hugo_Symbol, -Entrez_Gene_Id) %>%
+  t() %>%
+  as.data.frame()
+
+colnames(X) <- make.names(mrna_orig$Hugo_Symbol, unique = TRUE)
+
+y <- left_join(
+  x = data.frame(`Patient ID` = rownames(X), check.names = FALSE),
+  y = clinical_orig,
+  by = "Patient ID"
+) 
+```
+
+
+
+```{r}
+y <- y %>%
+  mutate(
+    bin_survival_months = case_when(
+      (`Overall Survival (Months)` <= 90) & 
+        (`Overall Survival Status` == "1:DECEASED") ~ 'low survival',
+      `Overall Survival (Months)` >= 160 ~ 'high survival',
+      TRUE ~ NA_character_  
+    )
+  )
+```
+
+
+## Dimensionality Reduction
+
+```{r}
+keep_p <- 5000
+
+var_vec <- apply(X, 2, var)
+var_threshold <- sort(var_vec, decreasing = T)[keep_p]
+X_filtered <- X[, which(var_vec >= var_threshold)]
+dim(X_filtered)
+```
+
+# CV strategy and Hyperparameters
+
+```{r}
+fit_df <- bind_cols(y = factor(y$bin_survival_months, levels = c("low survival", "high survival")), X_filtered)
+```
+
+```{r}
+set.seed(154)
+
+index <- createDataPartition(fit_df$y, p=.8, list = FALSE, times = 1)
+
+train_df <- fit_df[index, ]
+test_df <- fit_df[-index, ]
+```
+
+## Mtry
+
+```{r}
+set.seed(154)
+
+train_indices <- index
+my_folds <- createFolds(train_indices, k=9) 
+
+result_matrix <- as.data.frame(matrix(0, 9, 10))
+row = 1
+col = 1
+# col represent every mtry's accuracy
+# row represent every fold's accuracy
+
+for (fold in my_folds) {
+    train_data <- train_df[-fold,]
+    test_data <- train_df[fold,]
+    col = 1
+    for (mtryy in seq(10,100,by=10)) {
+      rf_fit <- ranger(y ~., mtry = mtryy, data = train_data, importance = "impurity")
+      p <- predict(rf_fit, test_data)
+      e <- ifelse(p$predictions == test_data$y, 1, 0)  
+      
+      result_matrix[row,col] <- sum(e) / nrow(test_data)
+      col = col + 1
+      
+    }
+    row = row + 1
+  }
+colMeans(result_matrix)
+```
+
+```{r}
+rf_fit.gini <- ranger(y ~., mtry = 90, data = train_df, importance = "impurity")
+
+rf_fit.hellinger <- ranger (y ~., mtry = 90, data = train_df, importance = "impurity", splitrule = "hellinger")
+
+rf_fit.extratrees <- ranger (y ~., mtry = 90, data = train_df, importance = "impurity", splitrule = "extratrees")
+
+rf_fit.gini$prediction.error
+rf_fit.hellinger$prediction.error
+rf_fit.extratrees$prediction.error
+```
+
+
+## Result
+
+```{r}
+rf_fit.opt <- rf_fit.gini
+p_real <- predict(rf_fit.opt, test_df)
+
+e <- ifelse(p_real$predictions == test_df$y, 1, 0) # If prediction is right return 1, otherwise return 0
+print(sum(e) / nrow(test_df)) 
+```
+
+```{r Gini importance in the classification setting}
+mdi_df <- tibble(Gene = names(rf_fit.opt$variable.importance),
+                 MDI = rf_fit.opt$variable.importance) %>%
+  # sort in descending order (top = most important genes)
+  arrange(-MDI)
+mdi_df
+```
+
+```{r permutation importance}
+rf_fit_permu <- ranger(y ~., mtry = 90, data = train_df,
+                 importance = "permutation")
+perm_df <- tibble(Gene = names(rf_fit_permu$variable.importance),
+                  Permutation = rf_fit_permu$variable.importance) %>%
+  # sort in descending order (top = most important genes)
+  arrange(-Permutation)
+perm_df
+```
+
+```{r}
+fi_df <- left_join(mdi_df, perm_df, by = "Gene")
+plt <- ggplot(fi_df) +
+  aes(x = MDI, y = Permutation, label = Gene) +
+  geom_point()
+plotly::ggplotly(plt)
+```
+
+# iRF and Interacting Genes
+
+```{r}
+train_matrix <- as.matrix(train_df[,-1])
+test_matrix <- as.matrix(test_df[,-1])
+CACHED_FNAME <- "irf.rds"
+if (!file.exists(CACHED_FNAME)) {
+  ITER <- 5
+  X_irf <- train_matrix
+  y_irf <- factor(train_df$y, levels = c("low survival", "high survival"))
+  irf_fit <- iRF(
+    x = X_irf, 
+    y = y_irf,
+    n.iter = ITER,
+    int.return = ITER,
+    signed = TRUE,
+    type = "ranger",
+    n.bootstrap = 50
+  )
+  read_forest <- readForest(irf_fit$rf.list, x = X_irf)
+  save(X_irf, y_irf, irf_fit, read_forest, file = "irf.rds")
+  # Read out metadata from random forest decision paths
+} else {
+  load(CACHED_FNAME)
+}
+```
+
+
+```{r}
+# Summary table of interactions with various metrics, evaluating the strength of the interaction
+irf_fit$interaction %>%
+  mutate(
+    across(where(is.numeric), ~formatC(.x, digits = 3, format = "g"))
+  ) %>%
+  DT::datatable()
+```
+
